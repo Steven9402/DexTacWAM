@@ -149,6 +149,7 @@ from utils.model_utils import load_condition_models, load_latent_models, load_va
 from utils.model_utils import forward_pass
 from utils.optimizer_utils import get_optimizer
 from utils.memory_utils import get_memory_statistics, free_memory
+from utils.distributed_utils import finish_training
 
 # ---------------------------------------------------- Stage 2 additions
 from models.tactile_models.projector import TactileProjector
@@ -3497,9 +3498,9 @@ class TactileDiTTrainer:
         # GC'd later during Python interpreter shutdown, which races with
         # NCCL process-group teardown and produces a silent exitcode 120
         # on rank 1+ ("Exception ignored in sys.unraisablehook" with no
-        # traceback). Single-rank runs don't expose this because the
-        # process group is trivial; multi-rank does. The legacy no-tactile
-        # path is unaffected (self._prepared_model aliases the wrapped
+        # traceback). This cleanup is applied on both single- and multi-rank
+        # runs. The legacy no-tactile path is unaffected
+        # (self._prepared_model aliases the wrapped
         # diffusion_model so the second nullify is idempotent).
         del self.diffusion_model, self.scheduler
         self._prepared_model = None
@@ -3565,80 +3566,8 @@ class TactileDiTTrainer:
         memory_statistics = get_memory_statistics()
         logger.info(f"Memory after training end: {json.dumps(memory_statistics, indent=4)}")
 
-        accelerator.end_training()
-
-        # Force-destroy NCCL process group WHILE the GIL + CUDA context are
-        # still healthy, NOT during Python interpreter shutdown.
-        #
-        # Why this is needed even after accelerator.end_training():
-        # accelerator.end_training() only finalizes trackers (TB, wandb);
-        # it does NOT call torch.distributed.destroy_process_group(). The
-        # default ProcessGroupNCCL therefore stays alive until interpreter
-        # shutdown, when the runner object in main.py goes out of scope.
-        # At that point the GC + atexit chain races with NCCL teardown,
-        # and one or more __del__ methods (DeepSpeed atexit stats dump,
-        # ProcessGroupNCCL.__del__, accelerator.__del__) raise after the
-        # NCCL communicator is half-torn-down. CPython prints
-        # "Exception ignored in sys.unraisablehook" on all ranks AND
-        # exits the FIRST rank to finish finalization with code 120
-        # (CPython's reserved code for "unhandled exception during
-        # interpreter finalization"). torchrun then reaps that rank,
-        # decides the run FAILED, SIGTERMs the other ranks, and reports
-        # the whole job as a failure -- even though training completed
-        # successfully (all ckpts on disk, >>> max train step reached
-        # logged, Memory after training end logged on all ranks).
-        #
-        # Observed empirically on the B1 50-step dryrun: 4-rank run
-        # consistently exits with exitcode 120 on rank 1 after both the
-        # earlier teardown patches (engine ref nullify + A3 multi-loader
-        # cleanup of train_dataloader/val_loaders/optimizer/lr_scheduler/
-        # writer/tactile_vae). Those patches reduced the surface area
-        # by clearing the heavyweight user-side refs, but the NCCL PG
-        # itself is held by the framework and only gets dropped at
-        # process exit -- which is the actual race.
-        #
-        # Fix: deterministically destroy the PG here. After this call,
-        # `torch.distributed.is_initialized()` returns False on all
-        # ranks. Any subsequent atexit / __del__ / GC callback that
-        # tries a collective sees the no-init state, raises, and is
-        # caught by Python's unraisable hook -- WITHOUT escalating to
-        # exit 120, because the exception now happens BEFORE interpreter
-        # finalization (during normal Python execution) where unraisable
-        # hooks are properly absorbed.
-        #
-        # accelerator.wait_for_everyone() (not raw dist.barrier()) is
-        # the final sync: it uses the correct device_ids internally and
-        # avoids the noisy "No device id is provided via barrier"
-        # UserWarning that we observed 4x in the previous dryrun logs.
-        try:
-            accelerator.wait_for_everyone()
-        except Exception as sync_err:
-            logger.warning(
-                f"[teardown] final wait_for_everyone raised "
-                f"(non-fatal, continuing to destroy_process_group): "
-                f"{type(sync_err).__name__}: {sync_err}"
-            )
-        try:
-            if torch.distributed.is_available() and torch.distributed.is_initialized():
-                torch.distributed.destroy_process_group()
-                logger.info("[teardown] destroyed default NCCL process group")
-        except Exception as pg_err:
-            logger.warning(
-                f"[teardown] destroy_process_group raised "
-                f"(non-fatal, exit may still be 120): "
-                f"{type(pg_err).__name__}: {pg_err}"
-            )
-
-        # Drop the trainer's strong ref to the accelerator so its
-        # __del__ runs while we still hold the GIL and have a known
-        # Python state. Without this, the accelerator survives until
-        # main() returns and gets GC'd during interpreter shutdown,
-        # where its destructor again races with whatever DeepSpeed /
-        # torch.distributed have left running.
-        try:
-            self.state.accelerator = None
-        except Exception:
-            pass
+        finish_training(accelerator)
+        self.state.accelerator = None
 
 
     def _compute_val_loss(
