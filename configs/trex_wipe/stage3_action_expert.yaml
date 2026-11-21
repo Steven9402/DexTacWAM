@@ -47,7 +47,7 @@ loss:
     - 176
     - state
 tactile_vae:
-  model_path: outputs/stage1_lite_v0d_full/2026_05_20_06_52_55/checkpoints/best_recall_post/model.pt
+  model_path: pretrained_models/dextacwam_tactile_encoder/model.pt
   config:
     adapter_kind: finger_set_transformer
     latent_channels: 128
@@ -128,7 +128,7 @@ flow_logit_std: 1.0
 flow_mode_scale: 1.29
 pixel_wise_timestep: true
 diffusion_model:
-  model_path: FILL_ME_AFTER_STAGE2_TRAINING
+  model_path: outputs/trex_wipe_stage2_world_model/2026_11_15_09_58_34/step_80000/diffusion_pytorch_model.safetensors
   config:
     activation_fn: gelu-approximate
     attention_bias: true
@@ -253,6 +253,7 @@ use_deepspeed: true
 deepspeed:
   zero_optimization:
     stage: 2
+    offload_optimizer: {device: cpu, pin_memory: true}
   fp16:
     enabled: false
   bf16:

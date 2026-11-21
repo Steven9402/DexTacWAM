@@ -28,7 +28,7 @@ loss:
   lambda_visual: 1.0
   lambda_tactile: 1.0
 tactile_vae:
-  model_path: outputs/stage1_lite_v0d_full/2026_05_20_06_52_55/checkpoints/best_recall_post/model.pt
+  model_path: pretrained_models/dextacwam_tactile_encoder/model.pt
   config:
     adapter_kind: finger_set_transformer
     latent_channels: 128
@@ -80,7 +80,7 @@ enable_slicing: true
 enable_tiling: true
 add_state: false
 caption_dropout_p: 0.06
-batch_size: 16
+batch_size: 1
 dataloader_num_workers: 12
 pin_memory: true
 prefetch_factor: 8
@@ -226,6 +226,7 @@ use_deepspeed: true
 deepspeed:
   zero_optimization:
     stage: 2
+    offload_optimizer: {device: cpu, pin_memory: true}
   fp16:
     enabled: false
   bf16:
