@@ -25,6 +25,7 @@ from einops import rearrange
 from copy import deepcopy
 import transformers
 import logging
+from PIL import Image, ImageDraw, ImageFont
 
 # ----------------------------------------------------
 import diffusers
@@ -945,6 +946,7 @@ class TactileInferencer:
 
             pd_actions_arr_all = None
             gt_actions_arr_all = None
+            rgb_frames_all = []
 
             for i_chunk_action in range(n_chunk_action):
                 cur_sidx = self.val_dataloader.dataset.fix_sidx
@@ -960,6 +962,9 @@ class TactileInferencer:
                 # 400). Replacing this with `for batch in val_dataloader`
                 # would break chunk advancement -- see plan discussion.
                 batch = next(iter(self.val_dataloader))
+                self._append_gt_rgb_frames_with_steps(
+                    batch, mem_size, action_chunk, i_chunk_action, rgb_frames_all,
+                )
 
                 # ---- Visual mem encode (per-frame; same as get_latents
                 #      mem path, but mem-only since action-mode discards
@@ -1490,6 +1495,57 @@ class TactileInferencer:
                 action_dim=action_dim,
                 model_save_dir=model_save_dir,
             )
+            if rgb_frames_all:
+                video_path = os.path.join(
+                    model_save_dir, f"val{i_validation}", "gt_rgb_with_step.mp4",
+                )
+                rgb_tensor = torch.from_numpy(np.stack(rgb_frames_all))
+                rgb_tensor = rearrange(rgb_tensor, "t h w c -> c t h w").float() / 127.5 - 1.0
+                save_video(
+                    rgb_tensor,
+                    video_path,
+                    fps=int(getattr(self.args, "basic_fps", 30)),
+                )
+                print(f"[tactile_inferencer] saved GT RGB video: {video_path}")
+
+    def _append_gt_rgb_frames_with_steps(
+        self,
+        batch,
+        mem_size,
+        action_chunk,
+        i_chunk_action,
+        output_frames,
+    ):
+        video = batch["video"][0, :, :, mem_size:].detach().cpu().clamp(-1, 1)
+        if video.ndim != 5:
+            raise ValueError(f"Expected GT video [C,V,T,H,W], got {tuple(video.shape)}")
+        n_future_frames = video.shape[2]
+        if n_future_frames < 1:
+            raise ValueError("No future GT RGB frames available for step video")
+
+        rgb_frames = []
+        for t in range(n_future_frames):
+            views = []
+            for v in range(video.shape[1]):
+                frame = video[:, v, t].permute(1, 2, 0).numpy()
+                frame = ((frame + 1.0) / 2.0 * 255.0).round().astype(np.uint8)
+                views.append(frame)
+            rgb_frames.append(np.concatenate(views, axis=1))
+
+        font = ImageFont.load_default(size=18)
+        for local_step in range(action_chunk):
+            rgb_index = min(local_step * n_future_frames // action_chunk, n_future_frames - 1)
+            global_step = i_chunk_action * action_chunk + local_step
+            image = Image.fromarray(rgb_frames[rgb_index])
+            ImageDraw.Draw(image).text(
+                (6, 6),
+                f"step={global_step}",
+                font=font,
+                fill=(255, 255, 255),
+                stroke_width=2,
+                stroke_fill=(0, 0, 0),
+            )
+            output_frames.append(np.asarray(image))
 
     def _dump_tactile_diagnostics(
         self,
